@@ -1,15 +1,15 @@
 /*
- * AIVideoUnlock — v7
+ * AIVideoUnlock — v8 (ported from working Frida script)
  *
- * Bisect complete:
- *   L2 with no thread guard → crash on com.apple.NSURLSession-delegate
- *   L2 removed (v6)        → no crash, no features (UI reads UserDefaults on main thread)
+ * Root cause confirmed:
+ *   L2 (boolForKey=YES) triggers app to verify receipt with Apple.
+ *   Apple returns empty receipt → app tries Swift cast → swift_dynamicCast crash.
  *
- * Fix: L2 with main-thread guard — only override boolForKey/integerForKey
- *      when called from the main thread (UI queries).
- *      Background threads (URLSession delegate) get the real value → no type-cast conflict.
- *
- * Active: L1 (JSON patcher) + L2 (main-thread-guarded) + L3 + L6 + L7
+ * Fix: port the Frida receipt forger exactly.
+ *   L1 ONLY fires on Apple receipt responses (has "receipt"/"environment"/"latest_receipt").
+ *   Injects real product IDs: gen_ai_yearly_2999 + gen_ai_weekly_999, status=0, far-future expiry.
+ *   L2 restored (all threads) — same as Frida which works.
+ *   L6 SSL bypass kept. L7 StoreKit restore kept. L3 FIRRC kept.
  */
 
 #import <Foundation/Foundation.h>
@@ -24,6 +24,10 @@
 
 #define TWLog(fmt, ...) NSLog(@"[AIUnlock] " fmt, ##__VA_ARGS__)
 
+static NSString *const kPremiumPat = @"isPremiumUser|isPremium\\b|premium_active|hasActiveSubscription|isPro\\b|isSubscribed|premiumPurchased|hasPaid|is_premium|subscription_active";
+static NSString *const kLimitPat   = @"limit|quota|max_|daily_|remaining_|credits";
+static NSString *const kLockPat    = @"isLocked|requiresPremium|pro_required|require_premium|premium_required|is_locked";
+
 static BOOL matchesPattern(NSString *str, NSString *pattern) {
     if (!str || ![str isKindOfClass:[NSString class]]) return NO;
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern
@@ -34,121 +38,108 @@ static BOOL matchesPattern(NSString *str, NSString *pattern) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 1 — NSJSONSerialization (type-preserving, existing keys only)
+// LAYER 1 — Apple receipt forger (exact port of Frida v5)
+// Only fires when response has receipt/environment/latest_receipt keys.
 // ═══════════════════════════════════════════════════════════════════════
-static NSString *const kPremiumKeyPat = @"isPremiumUser|isPremium\\b|premium_active|hasActiveSubscription|isPro\\b|isSubscribed|premiumPurchased|hasPaid|is_premium|subscription_active";
-static NSString *const kLockKeyPat    = @"isLocked|requiresPremium|pro_required|require_premium|premium_required|is_locked";
-static NSString *const kLimitKeyPat   = @"limit|quota|max_|daily_|remaining_|credits";
-static NSString *const kDateKeyPat    = @"expiresAt|expiry|expiration|expires_at|valid_until|subscription_end";
-
-static id patchValue(NSString *key, id value) {
-    if (!value || [value isKindOfClass:[NSNull class]]) return value;
-
-    if (matchesPattern(key, kPremiumKeyPat)) {
-        if ([value isKindOfClass:[NSNumber class]]) {
-            const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return @YES;
-            return @1;
-        }
-        if ([value isKindOfClass:[NSString class]]) {
-            NSString *lo = [(NSString *)value lowercaseString];
-            if ([lo isEqualToString:@"false"] || [lo isEqualToString:@"0"] || [lo isEqualToString:@"no"])
-                return @"true";
-        }
-        return value;
-    }
-
-    if (matchesPattern(key, kLockKeyPat)) {
-        if ([value isKindOfClass:[NSNumber class]]) {
-            const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return @NO;
-            return @0;
-        }
-        if ([value isKindOfClass:[NSString class]]) {
-            NSString *lo = [(NSString *)value lowercaseString];
-            if ([lo isEqualToString:@"true"] || [lo isEqualToString:@"1"] || [lo isEqualToString:@"yes"])
-                return @"false";
-        }
-        return value;
-    }
-
-    if (matchesPattern(key, kLimitKeyPat)) {
-        if ([value isKindOfClass:[NSNumber class]]) {
-            const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return value;
-            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0) return @999999.0;
-            return @999999;
-        }
-        return value;
-    }
-
-    if (matchesPattern(key, kDateKeyPat)) {
-        if ([value isKindOfClass:[NSNumber class]]) {
-            double orig = [(NSNumber *)value doubleValue];
-            const char *t = [(NSNumber *)value objCType];
-            double future = (orig > 1e10) ? 4102444800000.0 : 4102444800.0;
-            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0) return @(future);
-            return @((long long)future);
-        }
-        if ([value isKindOfClass:[NSString class]]) return @"2099-01-01T00:00:00Z";
-        return value;
-    }
-
-    return value;
+static BOOL looksLikeAppleReceipt(NSDictionary *d) {
+    if (![d isKindOfClass:[NSDictionary class]]) return NO;
+    return (d[@"receipt"] != nil || d[@"environment"] != nil || d[@"latest_receipt"] != nil);
 }
 
-static id patchJSON(id obj) {
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)obj;
-        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:d.count];
-        [d enumerateKeysAndObjectsUsingBlock:^(NSString *key, id val, BOOL *stop) {
-            id patched = patchValue(key, val);
-            if (patched == val && ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]))
-                patched = patchJSON(val);
-            out[key] = patched ?: val;
-        }];
-        return out;
+static NSDictionary *buildReceiptInfo(NSString *productID) {
+    return @{
+        @"product_id"                : productID,
+        @"expires_date_ms"           : @"4070908800000",
+        @"transaction_id"            : @"1000000000000001",
+        @"original_transaction_id"   : @"1000000000000001",
+        @"purchase_date_ms"          : @"1700000000000",
+        @"original_purchase_date_ms" : @"1700000000000",
+        @"is_trial_period"           : @"0",
+        @"is_in_intro_offer_period"  : @"0",
+        @"quantity"                  : @"1",
+        @"web_order_line_item_id"    : @"1"
+    };
+}
+
+static NSDictionary *buildRenewalInfo(NSString *productID) {
+    return @{
+        @"product_id"            : productID,
+        @"auto_renew_product_id" : productID,
+        @"auto_renew_status"     : @"1"
+    };
+}
+
+static id forgeAppleReceipt(NSDictionary *orig) {
+    // Check if already has valid products
+    id existingInfo = orig[@"latest_receipt_info"];
+    BOOL hasRealProducts = NO;
+    if ([existingInfo isKindOfClass:[NSArray class]])
+        hasRealProducts = [(NSArray *)existingInfo count] > 0;
+
+    id statusObj = orig[@"status"];
+    int oldStatus = [statusObj isKindOfClass:[NSNumber class]] ? [(NSNumber *)statusObj intValue] : -1;
+
+    if (oldStatus == 0 && hasRealProducts) {
+        TWLog(@"[L1] receipt status=0 with products — passthrough");
+        return orig;
     }
-    if ([obj isKindOfClass:[NSArray class]]) {
-        NSArray *a = (NSArray *)obj;
-        NSMutableArray *out = [NSMutableArray arrayWithCapacity:a.count];
-        for (id item in a) [out addObject:patchJSON(item)];
-        return out;
-    }
-    return obj;
+
+    TWLog(@"[L1] forging receipt (status=%d hasProducts=%d)", oldStatus, hasRealProducts);
+
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:orig];
+    out[@"status"]      = @0;
+    out[@"environment"] = @"Production";
+
+    out[@"latest_receipt_info"] = @[
+        buildReceiptInfo(@"gen_ai_yearly_2999"),
+        buildReceiptInfo(@"gen_ai_weekly_999")
+    ];
+    out[@"pending_renewal_info"] = @[
+        buildRenewalInfo(@"gen_ai_yearly_2999"),
+        buildRenewalInfo(@"gen_ai_weekly_999")
+    ];
+
+    return out;
 }
 
 %hook NSJSONSerialization
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)err {
     id orig = %orig;
-    if (!orig) return orig;
-    @try { return patchJSON(orig); }
-    @catch (NSException *e) { TWLog(@"[L1] err: %@", e); }
+    if (!orig || ![orig isKindOfClass:[NSDictionary class]]) return orig;
+    @try {
+        if (looksLikeAppleReceipt(orig)) return forgeAppleReceipt(orig);
+    } @catch (NSException *e) { TWLog(@"[L1] err: %@", e); }
     return orig;
 }
 %end
 
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 2 — NSUserDefaults (main-thread guard — UI reads only)
+// LAYER 2 — NSUserDefaults (all threads — same as Frida)
 // ═══════════════════════════════════════════════════════════════════════
 %hook NSUserDefaults
 
 - (BOOL)boolForKey:(NSString *)key {
     BOOL r = %orig;
-    if (!r && [NSThread isMainThread] && matchesPattern(key, kPremiumKeyPat)) return YES;
+    if (!r && matchesPattern(key, kPremiumPat)) return YES;
     return r;
 }
 
 - (NSInteger)integerForKey:(NSString *)key {
     NSInteger r = %orig;
-    if (r != 1 && [NSThread isMainThread] && matchesPattern(key, kPremiumKeyPat)) return 1;
+    if (r != 1 && matchesPattern(key, kPremiumPat)) return 1;
+    return r;
+}
+
+- (id)objectForKey:(NSString *)key {
+    id r = %orig;
+    if (matchesPattern(key, kPremiumPat)) return @YES;
     return r;
 }
 
 %end
 
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 3 — FIRRemoteConfig swizzle (ARC-safe)
+// LAYER 3 — FIRRemoteConfig swizzle
 // ═══════════════════════════════════════════════════════════════════════
 static IMP origFIRConfigValueForKey = NULL;
 
@@ -159,8 +150,8 @@ static id swizzled_FIRConfigValueForKey(id self, SEL _cmd, NSString *key) {
         Class FIRRCV = NSClassFromString(@"FIRRemoteConfigValue");
         if (!FIRRCV) return orig;
         NSString *newValue = nil;
-        if (matchesPattern(key, kPremiumKeyPat) || matchesPattern(key, kLockKeyPat)) newValue = @"false";
-        else if (matchesPattern(key, kLimitKeyPat)) newValue = @"999999";
+        if (matchesPattern(key, kPremiumPat) || matchesPattern(key, kLockPat)) newValue = @"false";
+        else if (matchesPattern(key, kLimitPat)) newValue = @"999999";
         if (!newValue) return orig;
         NSData *d = [newValue dataUsingEncoding:NSUTF8StringEncoding];
         SEL initSel = NSSelectorFromString(@"initWithData:source:");
@@ -217,8 +208,8 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
             id q = ((id(*)(id, SEL))objc_msgSend)((id)SK, @selector(defaultQueue));
             if (!q) return;
             ((void(*)(id, SEL))objc_msgSend)(q, @selector(restoreCompletedTransactions));
-            TWLog(@"[TRIGGER] restoreCompletedTransactions called");
-        } @catch (NSException *e) { TWLog(@"[TRIGGER] err: %@", e); }
+            TWLog(@"[L7] restoreCompletedTransactions called");
+        } @catch (NSException *e) { TWLog(@"[L7] err: %@", e); }
     });
 }
 
@@ -229,7 +220,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
     @autoreleasepool {
         @try {
             TWLog(@"════════════════════════════════════════════");
-            TWLog(@" AIVideoUnlock v7 — %@", [[NSBundle mainBundle] bundleIdentifier]);
+            TWLog(@" AIVideoUnlock v8 — %@", [[NSBundle mainBundle] bundleIdentifier]);
             TWLog(@"════════════════════════════════════════════");
 
             %init();
@@ -273,7 +264,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                 CFNotificationSuspensionBehaviorDeliverImmediately
             );
 
-            TWLog(@"[init] v7 ready — L2 main-thread-guarded");
+            TWLog(@"[init] v8 ready");
         } @catch (NSException *e) {
             TWLog(@"[ctor] fatal: %@", e);
         }

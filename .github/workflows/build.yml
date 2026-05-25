@@ -17,13 +17,14 @@ jobs:
         id: theos-cache
         with:
           path: ${{ github.workspace }}/theos
-          key: ${{ runner.os }}-theos-rootful
+          key: theos-sdks-v1
 
       - name: Install Theos
         if: steps.theos-cache.outputs.cache-hit != 'true'
         run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
         env:
           THEOS: ${{ github.workspace }}/theos
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Rootful
         run: make package
@@ -39,6 +40,7 @@ jobs:
   build-rootless:
     name: Build Rootless DEB
     runs-on: macos-latest
+    needs: build-rootful
     steps:
       - uses: actions/checkout@v4
 
@@ -47,13 +49,14 @@ jobs:
         id: theos-cache
         with:
           path: ${{ github.workspace }}/theos
-          key: ${{ runner.os }}-theos-rootless
+          key: theos-sdks-v1
 
       - name: Install Theos
         if: steps.theos-cache.outputs.cache-hit != 'true'
         run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
         env:
           THEOS: ${{ github.workspace }}/theos
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Rootless
         run: make package THEOS_PACKAGE_SCHEME=rootless

@@ -23,8 +23,16 @@
 
 // ─── toggles ───────────────────────────────────────────────────────────
 // #define ENABLE_CC_OBSERVER  1   // enable CCCrypt observer (verbose)
-#define ENABLE_NET_LOG      1   // log all URLs
-#define ENABLE_PIN_BYPASS   1   // bypass SSL pinning (for proxy interception)
+#define ENABLE_NET_LOG          1   // log all URLs
+#define ENABLE_PIN_BYPASS       1   // bypass SSL pinning (for proxy interception)
+#define ENABLE_JSON_HOOK        1   // L1: NSJSONSerialization hook
+#define ENABLE_RESP_REWRITE     1   // L4: NSURLSession response rewriter
+#define ENABLE_FIRESTORE_IN_L1  0   // L1 Path B: Firestore patch in JSON hook (broad, off — L4 covers it)
+#define ENABLE_RW_CLOUDFN       0   // L4: cloud-functions rewriter (risky — added shape changes)
+#define ENABLE_RW_AWS           1
+#define ENABLE_RW_KIE           1
+#define ENABLE_RW_FIREBASE      1
+#define ENABLE_RW_FIRESTORE     1
 
 #define TWLog(fmt, ...) NSLog(@"[AIUnlock] " fmt, ##__VA_ARGS__)
 
@@ -91,6 +99,7 @@ static BOOL matchesPattern(NSString *str, NSString *pattern) {
 // ═══════════════════════════════════════════════════════════════════════
 // LAYER 1 — NSJSONSerialization: forge Apple receipt + patch Firestore
 // ═══════════════════════════════════════════════════════════════════════
+#if ENABLE_JSON_HOOK
 %hook NSJSONSerialization
 
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
@@ -120,6 +129,7 @@ static BOOL matchesPattern(NSString *str, NSString *pattern) {
         return m;
     }
 
+#if ENABLE_FIRESTORE_IN_L1
     // Path B: Firestore document — rewrite premium fields
     if ([dict objectForKey:@"fields"] && [dict[@"fields"] isKindOfClass:[NSDictionary class]]) {
         NSMutableDictionary *m = [dict mutableCopy];
@@ -143,11 +153,13 @@ static BOOL matchesPattern(NSString *str, NSString *pattern) {
             return m;
         }
     }
+#endif
 
     return obj;
 }
 
 %end
+#endif  // ENABLE_JSON_HOOK
 
 // ═══════════════════════════════════════════════════════════════════════
 // LAYER 2 — NSUserDefaults: force premium keys
@@ -227,6 +239,7 @@ static id swizzled_FIRConfigValueForKey(id self, SEL _cmd, NSString *key) {
 // ═══════════════════════════════════════════════════════════════════════
 // LAYER 4 — NSURLSession response rewriter
 // ═══════════════════════════════════════════════════════════════════════
+#if ENABLE_RESP_REWRITE
 typedef struct {
     NSString *name;
     NSString *pattern;
@@ -251,14 +264,27 @@ static NSArray *gatePatches(void) {
         return m;
     };
 
+    // Only patch keys that ALREADY exist — never add new keys.
+    // Adding keys changes the response shape and breaks Swift `as!` casts in the app.
     NSDictionary *(^rwCloudFn)(NSDictionary *) = ^NSDictionary *(NSDictionary *j) {
         NSMutableDictionary *m = [j mutableCopy];
-        m[@"isPremium"]    = matchType(m[@"isPremium"],    @YES, @1, @"true");
-        m[@"isPro"]        = matchType(m[@"isPro"],        @YES, @1, @"true");
-        m[@"isSubscribed"] = matchType(m[@"isSubscribed"], @YES, @1, @"true");
-        m[@"expiresAt"]    = matchType(m[@"expiresAt"],    @YES, FAR_FUTURE_MS_NUM, FAR_FUTURE_MS);
-        m[@"status"]       = matchType(m[@"status"],       @YES, @1, @"active");
-        return m;
+        BOOL touched = NO;
+        for (NSString *k in [m allKeys]) {
+            if (matchesPattern(k, @"^(isPremium|isPro|isSubscribed|premium|pro|subscribed|active|paid)$")) {
+                m[k] = matchType(m[k], @YES, @1, @"true");
+                touched = YES;
+            } else if (matchesPattern(k, @"^(expiresAt|expires_at|expirationDate|expiration)$")) {
+                m[k] = matchType(m[k], @YES, FAR_FUTURE_MS_NUM, FAR_FUTURE_MS);
+                touched = YES;
+            } else if (matchesPattern(k, @"^(status|state)$")) {
+                m[k] = matchType(m[k], @YES, @1, @"active");
+                touched = YES;
+            } else if (matchesPattern(k, @"^(credits|quota|videosLeft|remaining|count|limit)$")) {
+                m[k] = matchType(m[k], @YES, @999999, @"999999");
+                touched = YES;
+            }
+        }
+        return touched ? m : j;
     };
 
     NSDictionary *(^rwKie)(NSDictionary *) = ^NSDictionary *(NSDictionary *j) {
@@ -300,23 +326,33 @@ static NSArray *gatePatches(void) {
         return m;
     };
 
-    cached = @[
-        @{@"name": @"firebase-remote-config",
-          @"pattern": @"firebaseremoteconfig\\.googleapis\\.com.*namespaces/firebase:fetch",
-          @"rewrite": rwFirebase},
-        @{@"name": @"cloud-functions",
-          @"pattern": @"cloudfunctions\\.net|us-central1-.*\\.cloudfunctions\\.net",
-          @"rewrite": rwCloudFn},
-        @{@"name": @"kie.ai",
-          @"pattern": @"api\\.kie\\.ai",
-          @"rewrite": rwKie},
-        @{@"name": @"aws-execute-api",
-          @"pattern": @"execute-api\\..*amazonaws\\.com",
-          @"rewrite": rwAws},
-        @{@"name": @"firestore-doc",
-          @"pattern": @"firestore\\.googleapis\\.com.*/documents/users/",
-          @"rewrite": rwFirestore},
-    ];
+    NSMutableArray *list = [NSMutableArray array];
+#if ENABLE_RW_FIREBASE
+    [list addObject:@{@"name": @"firebase-remote-config",
+                      @"pattern": @"firebaseremoteconfig\\.googleapis\\.com.*namespaces/firebase:fetch",
+                      @"rewrite": rwFirebase}];
+#endif
+#if ENABLE_RW_CLOUDFN
+    [list addObject:@{@"name": @"cloud-functions",
+                      @"pattern": @"cloudfunctions\\.net|us-central1-.*\\.cloudfunctions\\.net",
+                      @"rewrite": rwCloudFn}];
+#endif
+#if ENABLE_RW_KIE
+    [list addObject:@{@"name": @"kie.ai",
+                      @"pattern": @"api\\.kie\\.ai",
+                      @"rewrite": rwKie}];
+#endif
+#if ENABLE_RW_AWS
+    [list addObject:@{@"name": @"aws-execute-api",
+                      @"pattern": @"execute-api\\..*amazonaws\\.com",
+                      @"rewrite": rwAws}];
+#endif
+#if ENABLE_RW_FIRESTORE
+    [list addObject:@{@"name": @"firestore-doc",
+                      @"pattern": @"firestore\\.googleapis\\.com.*/documents/users/",
+                      @"rewrite": rwFirestore}];
+#endif
+    cached = list;
     return cached;
 }
 
@@ -365,6 +401,7 @@ static NSArray *gatePatches(void) {
 }
 
 %end
+#endif  // ENABLE_RESP_REWRITE
 
 // ═══════════════════════════════════════════════════════════════════════
 // LAYER 5 — CCCrypt observer (optional)

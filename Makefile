@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = AIVideoUnlock
 
 AIVideoUnlock_FILES = Tweak.x
-AIVideoUnlock_CFLAGS = -fobjc-arc
+AIVideoUnlock_CFLAGS = -fobjc-arc -Wno-unused-variable
 AIVideoUnlock_FRAMEWORKS = Foundation UIKit StoreKit Security
 AIVideoUnlock_PRIVATE_FRAMEWORKS =
 AIVideoUnlock_LIBRARIES =

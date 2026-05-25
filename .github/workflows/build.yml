@@ -6,40 +6,62 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-rootful:
+    name: Build Rootful DEB
     runs-on: macos-latest
-    strategy:
-      matrix:
-        include:
-          - scheme: rootful
-            suffix: ""
-          - scheme: rootless
-            suffix: THEOS_PACKAGE_SCHEME=rootless
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Cache Theos
         uses: actions/cache@v4
         id: theos-cache
         with:
           path: ${{ github.workspace }}/theos
-          key: ${{ runner.os }}-theos
+          key: ${{ runner.os }}-theos-rootful
 
       - name: Install Theos
         if: steps.theos-cache.outputs.cache-hit != 'true'
-        run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: Build (${{ matrix.scheme }})
-        run: make package ${{ matrix.suffix }}
+      - name: Build Rootful
+        run: make package
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: Upload ${{ matrix.scheme }} DEB
+      - name: Upload Rootful DEB
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.scheme }}-deb
+          name: rootful-deb
+          path: packages/*.deb
+
+  build-rootless:
+    name: Build Rootless DEB
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Theos
+        uses: actions/cache@v4
+        id: theos-cache
+        with:
+          path: ${{ github.workspace }}/theos
+          key: ${{ runner.os }}-theos-rootless
+
+      - name: Install Theos
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build Rootless
+        run: make package THEOS_PACKAGE_SCHEME=rootless
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Upload Rootless DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootless-deb
           path: packages/*.deb

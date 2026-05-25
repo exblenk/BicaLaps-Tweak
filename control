@@ -1,0 +1,9 @@
+Package: com.unlock.aivideo
+Name: AI Video Unlock
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Unlocks premium features in AI Video Maker — 7-layer IAP bypass (receipt forger, UserDefaults, Firebase Remote Config, NSURLSession gates, Firestore, SSL pinning).
+Maintainer: anon
+Author: anon
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)

@@ -31,6 +31,20 @@
 static NSString *const PRODUCT_YEAR  = @"gen_ai_yearly_2999";
 static NSString *const PRODUCT_WEEK  = @"gen_ai_weekly_999";
 static NSString *const FAR_FUTURE_MS = @"4070908800000";
+static NSNumber *const FAR_FUTURE_MS_NUM = @4070908800000;
+static NSString *const FAR_FUTURE_ISO = @"2099-12-31T23:59:59Z";
+
+// Type-preserving patch: matches the original value's class.
+static id matchType(id orig, NSNumber *boolVal, NSNumber *numVal, NSString *strVal) {
+    if (!orig) return boolVal;
+    if ([orig isKindOfClass:[NSNumber class]]) {
+        const char *t = [(NSNumber *)orig objCType];
+        if (t && (t[0] == 'c' || t[0] == 'B')) return boolVal;  // bool
+        return numVal;
+    }
+    if ([orig isKindOfClass:[NSString class]]) return strVal;
+    return orig;
+}
 
 // ─── helpers ───────────────────────────────────────────────────────────
 static NSMutableDictionary *buildReceiptInfo(NSString *pid) {
@@ -239,22 +253,22 @@ static NSArray *gatePatches(void) {
 
     NSDictionary *(^rwCloudFn)(NSDictionary *) = ^NSDictionary *(NSDictionary *j) {
         NSMutableDictionary *m = [j mutableCopy];
-        m[@"isPremium"] = @YES;
-        m[@"isPro"] = @YES;
-        m[@"isSubscribed"] = @YES;
-        m[@"expiresAt"] = FAR_FUTURE_MS;
-        m[@"status"] = @"active";
+        m[@"isPremium"]    = matchType(m[@"isPremium"],    @YES, @1, @"true");
+        m[@"isPro"]        = matchType(m[@"isPro"],        @YES, @1, @"true");
+        m[@"isSubscribed"] = matchType(m[@"isSubscribed"], @YES, @1, @"true");
+        m[@"expiresAt"]    = matchType(m[@"expiresAt"],    @YES, FAR_FUTURE_MS_NUM, FAR_FUTURE_MS);
+        m[@"status"]       = matchType(m[@"status"],       @YES, @1, @"active");
         return m;
     };
 
     NSDictionary *(^rwKie)(NSDictionary *) = ^NSDictionary *(NSDictionary *j) {
         NSMutableDictionary *m = [j mutableCopy];
-        if (m[@"code"]) m[@"code"] = @(200);
-        if (m[@"msg"]) m[@"msg"] = @"success";
+        if (m[@"code"]) m[@"code"] = matchType(m[@"code"], @YES, @200, @"200");
+        if (m[@"msg"])  m[@"msg"]  = matchType(m[@"msg"],  @YES, @0,   @"success");
         if ([m[@"data"] isKindOfClass:[NSDictionary class]]) {
             NSMutableDictionary *d = [m[@"data"] mutableCopy];
-            if (d[@"credits"]) d[@"credits"] = @(999999);
-            if (d[@"quota"]) d[@"quota"] = @(999999);
+            if (d[@"credits"]) d[@"credits"] = matchType(d[@"credits"], @YES, @999999, @"999999");
+            if (d[@"quota"])   d[@"quota"]   = matchType(d[@"quota"],   @YES, @999999, @"999999");
             m[@"data"] = d;
         }
         return m;
@@ -262,11 +276,11 @@ static NSArray *gatePatches(void) {
 
     NSDictionary *(^rwAws)(NSDictionary *) = ^NSDictionary *(NSDictionary *j) {
         NSMutableDictionary *m = [j mutableCopy];
-        if (m[@"videosLeft"]) m[@"videosLeft"] = @(999);
-        if (m[@"isServerBusy"]) m[@"isServerBusy"] = @NO;
-        if (m[@"isGrokServerBusy"]) m[@"isGrokServerBusy"] = @NO;
-        if (m[@"quotaExceeded"]) m[@"quotaExceeded"] = @NO;
-        if (m[@"isShow"]) m[@"isShow"] = @YES;
+        if (m[@"videosLeft"])       m[@"videosLeft"]       = matchType(m[@"videosLeft"],       @YES, @999, @"999");
+        if (m[@"isServerBusy"])     m[@"isServerBusy"]     = matchType(m[@"isServerBusy"],     @NO,  @0,   @"false");
+        if (m[@"isGrokServerBusy"]) m[@"isGrokServerBusy"] = matchType(m[@"isGrokServerBusy"], @NO,  @0,   @"false");
+        if (m[@"quotaExceeded"])    m[@"quotaExceeded"]    = matchType(m[@"quotaExceeded"],    @NO,  @0,   @"false");
+        if (m[@"isShow"])           m[@"isShow"]           = matchType(m[@"isShow"],           @YES, @1,   @"true");
         return m;
     };
 

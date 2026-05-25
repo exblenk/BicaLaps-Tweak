@@ -1,12 +1,12 @@
 /*
- * AIVideoUnlock — BISECT v2
+ * AIVideoUnlock — BISECT v3
  *
- * Previous minimal still crashed → cause is NOT in L1/L4.
- * Disabling: L2 (NSUserDefaults), L3 (FIRRemoteConfig swizzle).
- * Keeping:   L6 (SSL bypass) + L7 (restore txns) only.
+ * v2 (L6+L7 only) did NOT crash → cause is L2 or L3.
+ * This build adds L2 back (boolForKey + integerForKey only — no objectForKey).
+ * objectForKey excluded because returning @YES for a non-bool key = swift_dynamicCast bomb.
  *
- * If this build does NOT crash → cause is L2 or L3.
- * If it STILL crashes        → cause is L6 (SecTrust hook).
+ * If this crashes → L2 boolForKey/integerForKey is the cause.
+ * If no crash    → L3 (FIRRemoteConfig) is the cause.
  */
 
 #import <Foundation/Foundation.h>
@@ -21,8 +21,40 @@
 
 #define TWLog(fmt, ...) NSLog(@"[AIUnlock] " fmt, ##__VA_ARGS__)
 
+static BOOL matchesPattern(NSString *str, NSString *pattern) {
+    if (!str || ![str isKindOfClass:[NSString class]]) return NO;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern
+                                                                       options:NSRegularExpressionCaseInsensitive
+                                                                         error:nil];
+    if (!re) return NO;
+    return [re numberOfMatchesInString:str options:0 range:NSMakeRange(0, str.length)] > 0;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 6 — SSL pinning bypass (C symbols)
+// LAYER 2 — NSUserDefaults (boolForKey + integerForKey ONLY — no objectForKey)
+// ═══════════════════════════════════════════════════════════════════════
+static NSString *const kPremiumPattern = @"isPremiumUser|isPremium\\b|premium_active|hasActiveSubscription|isPro\\b|isSubscribed|premiumPurchased|hasPaid";
+
+%hook NSUserDefaults
+
+- (BOOL)boolForKey:(NSString *)key {
+    BOOL r = %orig;
+    if (!r && matchesPattern(key, kPremiumPattern)) return YES;
+    return r;
+}
+
+- (NSInteger)integerForKey:(NSString *)key {
+    NSInteger r = %orig;
+    if (r != 1 && matchesPattern(key, kPremiumPattern)) return 1;
+    return r;
+}
+
+// objectForKey intentionally omitted — too risky for Swift type casts
+
+%end
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYER 6 — SSL pinning bypass
 // ═══════════════════════════════════════════════════════════════════════
 #if ENABLE_PIN_BYPASS
 
@@ -41,7 +73,7 @@ static bool new_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) 
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 7 — Auto restoreCompletedTransactions via launch notification
+// LAYER 7 — Auto restoreCompletedTransactions
 // ═══════════════════════════════════════════════════════════════════════
 static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                           CFNotificationName name, const void *object,
@@ -65,9 +97,11 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
 %ctor {
     @autoreleasepool {
         @try {
-            TWLog(@"════════════════════════════════════════════");
-            TWLog(@" AIVideoUnlock BISECT v2 — only L6+L7 active");
-            TWLog(@"════════════════════════════════════════════");
+            TWLog(@"═══════════════════════════════════════");
+            TWLog(@" AIVideoUnlock BISECT v3 — L2(safe)+L6+L7");
+            TWLog(@"═══════════════════════════════════════");
+
+            %init();
 
 #if ENABLE_PIN_BYPASS
             @try {
@@ -75,7 +109,6 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                 if (sec1) MSHookFunction(sec1, (void *)new_SecTrustEvaluate, (void **)&orig_SecTrustEvaluate);
                 void *sec2 = dlsym(RTLD_DEFAULT, "SecTrustEvaluateWithError");
                 if (sec2) MSHookFunction(sec2, (void *)new_SecTrustEvaluateWithError, (void **)&orig_SecTrustEvaluateWithError);
-                TWLog(@"[init] SecTrust* hooked");
             } @catch (NSException *e) { TWLog(@"[init] SecTrust err: %@", e); }
 #endif
 
@@ -88,7 +121,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                 CFNotificationSuspensionBehaviorDeliverImmediately
             );
 
-            TWLog(@"[init] bisect v2 ready");
+            TWLog(@"[init] bisect v3 ready");
         } @catch (NSException *e) {
             TWLog(@"[ctor] fatal: %@", e);
         }

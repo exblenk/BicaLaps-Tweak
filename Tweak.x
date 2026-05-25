@@ -1,17 +1,14 @@
 /*
- * AIVideoUnlock — FULL v5
+ * AIVideoUnlock — v6
  *
- * Bisect result:
- *   L6+L7 alone     = no crash ✅
- *   L2+L6+L7        = crash ❌  (premium flag=true but server sends free-user JSON → Swift cast fails)
+ * Bisect summary:
+ *   L6+L7 only          → no crash ✅
+ *   L2+L6+L7            → crash ❌  (L2 triggers premium code path before server confirms it)
+ *   L1+L2+L3+L6+L7 (v5) → crash ❌  (L2 still races with URLSession-delegate type cast)
  *
- * Fix strategy:
- *   L1 (NSJSONSerialization) patches server JSON to match premium expectations.
- *   Rule: ONLY modify EXISTING keys — never add new ones, always preserve value type.
- *   L2 boolForKey/integerForKey kept (no objectForKey — too risky for Swift casts).
- *   L3 FIRRemoteConfig swizzle back (ARC-safe, read-only path).
- *   L6 SSL bypass.
- *   L7 restoreCompletedTransactions.
+ * Fix: remove L2 entirely. L1 patches server JSON in-place (type-safe, existing keys only).
+ * The app will read premium=true from server response and store it in UserDefaults itself.
+ * L3 handles Firebase Remote Config. L6 SSL bypass. L7 restore transactions.
  */
 
 #import <Foundation/Foundation.h>
@@ -36,25 +33,20 @@ static BOOL matchesPattern(NSString *str, NSString *pattern) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// LAYER 1 — NSJSONSerialization (type-preserving, existing-keys-only)
+// LAYER 1 — NSJSONSerialization (type-preserving, existing keys only)
 // ═══════════════════════════════════════════════════════════════════════
-static NSString *const kPremiumKeyPat  = @"isPremiumUser|isPremium\\b|premium_active|hasActiveSubscription|isPro\\b|isSubscribed|premiumPurchased|hasPaid|is_premium|subscription_active";
-static NSString *const kLockKeyPat     = @"isLocked|requiresPremium|pro_required|require_premium|premium_required|is_locked";
-static NSString *const kLimitKeyPat    = @"limit|quota|max_|daily_|remaining_|credits";
-static NSString *const kDateKeyPat     = @"expiresAt|expiry|expiration|expires_at|valid_until|subscription_end";
+static NSString *const kPremiumKeyPat = @"isPremiumUser|isPremium\\b|premium_active|hasActiveSubscription|isPro\\b|isSubscribed|premiumPurchased|hasPaid|is_premium|subscription_active";
+static NSString *const kLockKeyPat    = @"isLocked|requiresPremium|pro_required|require_premium|premium_required|is_locked";
+static NSString *const kLimitKeyPat   = @"limit|quota|max_|daily_|remaining_|credits";
+static NSString *const kDateKeyPat    = @"expiresAt|expiry|expiration|expires_at|valid_until|subscription_end";
 
-// Patch a single value, preserving its original type.
-// Returns patched value or original if type unknown / not patchable.
 static id patchValue(NSString *key, id value) {
     if (!value || [value isKindOfClass:[NSNull class]]) return value;
 
-    // Premium/subscription keys → true/1
     if (matchesPattern(key, kPremiumKeyPat)) {
         if ([value isKindOfClass:[NSNumber class]]) {
-            // Distinguish bool (objCType == 'c') from int
             const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0)
-                return @YES;
+            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return @YES;
             return @1;
         }
         if ([value isKindOfClass:[NSString class]]) {
@@ -65,12 +57,10 @@ static id patchValue(NSString *key, id value) {
         return value;
     }
 
-    // Lock keys → false/0
     if (matchesPattern(key, kLockKeyPat)) {
         if ([value isKindOfClass:[NSNumber class]]) {
             const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0)
-                return @NO;
+            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return @NO;
             return @0;
         }
         if ([value isKindOfClass:[NSString class]]) {
@@ -81,49 +71,37 @@ static id patchValue(NSString *key, id value) {
         return value;
     }
 
-    // Limit/quota keys → large number, preserving type
     if (matchesPattern(key, kLimitKeyPat)) {
         if ([value isKindOfClass:[NSNumber class]]) {
             const char *t = [(NSNumber *)value objCType];
-            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0)
-                return value; // don't touch bool-typed limits
-            // return same numeric type with large value
-            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0)
-                return @999999.0;
+            if (strcmp(t, @encode(BOOL)) == 0 || strcmp(t, @encode(bool)) == 0) return value;
+            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0) return @999999.0;
             return @999999;
         }
         return value;
     }
 
-    // Expiry date keys → far future (year 2099), preserving type
     if (matchesPattern(key, kDateKeyPat)) {
         if ([value isKindOfClass:[NSNumber class]]) {
-            // milliseconds or seconds — if > 1e10 it's ms, else seconds
             double orig = [(NSNumber *)value doubleValue];
             const char *t = [(NSNumber *)value objCType];
             double future = (orig > 1e10) ? 4102444800000.0 : 4102444800.0;
-            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0)
-                return @(future);
+            if (strcmp(t, @encode(double)) == 0 || strcmp(t, @encode(float)) == 0) return @(future);
             return @((long long)future);
         }
-        if ([value isKindOfClass:[NSString class]]) {
-            // ISO date string — return a far-future date
-            return @"2099-01-01T00:00:00Z";
-        }
+        if ([value isKindOfClass:[NSString class]]) return @"2099-01-01T00:00:00Z";
         return value;
     }
 
     return value;
 }
 
-// Recursively patch a JSON object (dict or array).
 static id patchJSON(id obj) {
     if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)obj;
         NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:d.count];
         [d enumerateKeysAndObjectsUsingBlock:^(NSString *key, id val, BOOL *stop) {
             id patched = patchValue(key, val);
-            // Recurse into nested dicts/arrays (but don't recurse into already-patched primitives)
             if (patched == val && ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]))
                 patched = patchJSON(val);
             out[key] = patched ?: val;
@@ -140,34 +118,13 @@ static id patchJSON(id obj) {
 }
 
 %hook NSJSONSerialization
-
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)err {
     id orig = %orig;
     if (!orig) return orig;
     @try { return patchJSON(orig); }
-    @catch (NSException *e) { TWLog(@"[L1] patch err: %@", e); }
+    @catch (NSException *e) { TWLog(@"[L1] err: %@", e); }
     return orig;
 }
-
-%end
-
-// ═══════════════════════════════════════════════════════════════════════
-// LAYER 2 — NSUserDefaults (boolForKey + integerForKey, no objectForKey)
-// ═══════════════════════════════════════════════════════════════════════
-%hook NSUserDefaults
-
-- (BOOL)boolForKey:(NSString *)key {
-    BOOL r = %orig;
-    if (!r && matchesPattern(key, kPremiumKeyPat)) return YES;
-    return r;
-}
-
-- (NSInteger)integerForKey:(NSString *)key {
-    NSInteger r = %orig;
-    if (r != 1 && matchesPattern(key, kPremiumKeyPat)) return 1;
-    return r;
-}
-
 %end
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -181,21 +138,16 @@ static id swizzled_FIRConfigValueForKey(id self, SEL _cmd, NSString *key) {
         if (!key || ![key isKindOfClass:[NSString class]]) return orig;
         Class FIRRCV = NSClassFromString(@"FIRRemoteConfigValue");
         if (!FIRRCV) return orig;
-
         NSString *newValue = nil;
-        if (matchesPattern(key, kPremiumKeyPat) || matchesPattern(key, kLockKeyPat))
-            newValue = @"false";
-        else if (matchesPattern(key, kLimitKeyPat))
-            newValue = @"999999";
+        if (matchesPattern(key, kPremiumKeyPat) || matchesPattern(key, kLockKeyPat)) newValue = @"false";
+        else if (matchesPattern(key, kLimitKeyPat)) newValue = @"999999";
         if (!newValue) return orig;
-
         NSData *d = [newValue dataUsingEncoding:NSUTF8StringEncoding];
         SEL initSel = NSSelectorFromString(@"initWithData:source:");
         id raw = [FIRRCV alloc];
         if (![raw respondsToSelector:initSel]) return orig;
         id v = ((id (*)(id, SEL, NSData *, int))objc_msgSend)(raw, initSel, d, 2);
-        if (!v) return orig;
-        return v;
+        return v ?: orig;
     } @catch (NSException *e) { TWLog(@"[L3] err: %@", e); }
     return orig;
 }
@@ -257,12 +209,11 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
     @autoreleasepool {
         @try {
             TWLog(@"════════════════════════════════════════════");
-            TWLog(@" AIVideoUnlock v5 loaded — %@", [[NSBundle mainBundle] bundleIdentifier]);
+            TWLog(@" AIVideoUnlock v6 — %@", [[NSBundle mainBundle] bundleIdentifier]);
             TWLog(@"════════════════════════════════════════════");
 
             %init();
 
-            // L3 — FIRRemoteConfig swizzle
             @try {
                 Class FIRRC = NSClassFromString(@"FIRRemoteConfig");
                 if (FIRRC) {
@@ -286,11 +237,11 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
 
             @try {
                 if (NSClassFromString(@"AFSecurityPolicy")) { %init(AFNetworkingPin); }
-            } @catch (NSException *e) { TWLog(@"[init] AF err: %@", e); }
+            } @catch (NSException *e) {}
 
             @try {
                 if (NSClassFromString(@"TSKPinningValidator")) { %init(TrustKitPin); }
-            } @catch (NSException *e) { TWLog(@"[init] TSK err: %@", e); }
+            } @catch (NSException *e) {}
 #endif
 
             CFNotificationCenterAddObserver(
@@ -302,7 +253,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                 CFNotificationSuspensionBehaviorDeliverImmediately
             );
 
-            TWLog(@"[init] v5 ready");
+            TWLog(@"[init] v6 ready — L1+L3+L6+L7 active, L2 disabled");
         } @catch (NSException *e) {
             TWLog(@"[ctor] fatal: %@", e);
         }

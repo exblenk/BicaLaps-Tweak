@@ -1,14 +1,15 @@
 /*
- * AIVideoUnlock — v6
+ * AIVideoUnlock — v7
  *
- * Bisect summary:
- *   L6+L7 only          → no crash ✅
- *   L2+L6+L7            → crash ❌  (L2 triggers premium code path before server confirms it)
- *   L1+L2+L3+L6+L7 (v5) → crash ❌  (L2 still races with URLSession-delegate type cast)
+ * Bisect complete:
+ *   L2 with no thread guard → crash on com.apple.NSURLSession-delegate
+ *   L2 removed (v6)        → no crash, no features (UI reads UserDefaults on main thread)
  *
- * Fix: remove L2 entirely. L1 patches server JSON in-place (type-safe, existing keys only).
- * The app will read premium=true from server response and store it in UserDefaults itself.
- * L3 handles Firebase Remote Config. L6 SSL bypass. L7 restore transactions.
+ * Fix: L2 with main-thread guard — only override boolForKey/integerForKey
+ *      when called from the main thread (UI queries).
+ *      Background threads (URLSession delegate) get the real value → no type-cast conflict.
+ *
+ * Active: L1 (JSON patcher) + L2 (main-thread-guarded) + L3 + L6 + L7
  */
 
 #import <Foundation/Foundation.h>
@@ -128,6 +129,25 @@ static id patchJSON(id obj) {
 %end
 
 // ═══════════════════════════════════════════════════════════════════════
+// LAYER 2 — NSUserDefaults (main-thread guard — UI reads only)
+// ═══════════════════════════════════════════════════════════════════════
+%hook NSUserDefaults
+
+- (BOOL)boolForKey:(NSString *)key {
+    BOOL r = %orig;
+    if (!r && [NSThread isMainThread] && matchesPattern(key, kPremiumKeyPat)) return YES;
+    return r;
+}
+
+- (NSInteger)integerForKey:(NSString *)key {
+    NSInteger r = %orig;
+    if (r != 1 && [NSThread isMainThread] && matchesPattern(key, kPremiumKeyPat)) return 1;
+    return r;
+}
+
+%end
+
+// ═══════════════════════════════════════════════════════════════════════
 // LAYER 3 — FIRRemoteConfig swizzle (ARC-safe)
 // ═══════════════════════════════════════════════════════════════════════
 static IMP origFIRConfigValueForKey = NULL;
@@ -209,7 +229,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
     @autoreleasepool {
         @try {
             TWLog(@"════════════════════════════════════════════");
-            TWLog(@" AIVideoUnlock v6 — %@", [[NSBundle mainBundle] bundleIdentifier]);
+            TWLog(@" AIVideoUnlock v7 — %@", [[NSBundle mainBundle] bundleIdentifier]);
             TWLog(@"════════════════════════════════════════════");
 
             %init();
@@ -253,7 +273,7 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                 CFNotificationSuspensionBehaviorDeliverImmediately
             );
 
-            TWLog(@"[init] v6 ready — L1+L3+L6+L7 active, L2 disabled");
+            TWLog(@"[init] v7 ready — L2 main-thread-guarded");
         } @catch (NSException *e) {
             TWLog(@"[ctor] fatal: %@", e);
         }

@@ -25,8 +25,8 @@
 // #define ENABLE_CC_OBSERVER  1   // enable CCCrypt observer (verbose)
 #define ENABLE_NET_LOG          1   // log all URLs
 #define ENABLE_PIN_BYPASS       1   // bypass SSL pinning (for proxy interception)
-#define ENABLE_JSON_HOOK        1   // L1: NSJSONSerialization hook
-#define ENABLE_RESP_REWRITE     1   // L4: NSURLSession response rewriter
+#define ENABLE_JSON_HOOK        0   // L1: NSJSONSerialization hook — OFF (debugging crash)
+#define ENABLE_RESP_REWRITE     0   // L4: NSURLSession response rewriter — OFF (debugging crash)
 #define ENABLE_FIRESTORE_IN_L1  0   // L1 Path B: Firestore patch in JSON hook (broad, off — L4 covers it)
 #define ENABLE_RW_CLOUDFN       0   // L4: cloud-functions rewriter (risky — added shape changes)
 #define ENABLE_RW_AWS           1
@@ -213,27 +213,26 @@ static id swizzled_FIRConfigValueForKey(id self, SEL _cmd, NSString *key) {
     Class FIRRCV = NSClassFromString(@"FIRRemoteConfigValue");
     if (!FIRRCV) return orig;
 
+    NSData *d = nil;
+    NSString *logVal = nil;
     if (matchesPattern(key, @"premium|paid|pro_required|require|locked")) {
-        NSData *d = [@"false" dataUsingEncoding:NSUTF8StringEncoding];
-        id v = [[FIRRCV alloc] init];
-        // Try the known initializer
-        SEL init = NSSelectorFromString(@"initWithData:source:");
-        if ([v respondsToSelector:init]) {
-            ((id (*)(id, SEL, NSData *, int))objc_msgSend)(v, init, d, 2);
-            TWLog(@"[FIRRC] \"%@\" → false", key);
-            return v;
-        }
+        d = [@"false" dataUsingEncoding:NSUTF8StringEncoding];
+        logVal = @"false";
     } else if (matchesPattern(key, @"limit|quota|max|daily")) {
-        NSData *d = [@"999999" dataUsingEncoding:NSUTF8StringEncoding];
-        id v = [[FIRRCV alloc] init];
-        SEL init = NSSelectorFromString(@"initWithData:source:");
-        if ([v respondsToSelector:init]) {
-            ((id (*)(id, SEL, NSData *, int))objc_msgSend)(v, init, d, 2);
-            TWLog(@"[FIRRC] \"%@\" → 999999", key);
-            return v;
-        }
+        d = [@"999999" dataUsingEncoding:NSUTF8StringEncoding];
+        logVal = @"999999";
     }
-    return orig;
+    if (!d) return orig;
+
+    // Correct ARC-safe construction: alloc, then a single init call whose
+    // return value is captured (init may return a different instance).
+    SEL initSel = NSSelectorFromString(@"initWithData:source:");
+    id raw = [FIRRCV alloc];
+    if (![raw respondsToSelector:initSel]) return orig;
+    id v = ((id (*)(id, SEL, NSData *, int))objc_msgSend)(raw, initSel, d, 2);
+    if (!v) return orig;
+    TWLog(@"[FIRRC] \"%@\" → %@", key, logVal);
+    return v;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

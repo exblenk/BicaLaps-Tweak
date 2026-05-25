@@ -428,6 +428,10 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
             TWLog(@" AIVideoUnlock loaded into %@", [[NSBundle mainBundle] bundleIdentifier]);
             TWLog(@"════════════════════════════════════════════");
 
+            // Required when any %group is used — initializes the ungrouped hooks
+            // (NSJSONSerialization, NSUserDefaults, NSURLSession).
+            %init();
+
             // L3 — FIRRemoteConfig swizzle if class present
             @try {
                 Class FIRRC = NSClassFromString(@"FIRRemoteConfig");

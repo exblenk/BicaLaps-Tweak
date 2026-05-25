@@ -1,0 +1,45 @@
+name: Build DEB (Rootful + Rootless)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - scheme: rootful
+            suffix: ""
+          - scheme: rootless
+            suffix: THEOS_PACKAGE_SCHEME=rootless
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: actions/cache@v4
+        id: theos-cache
+        with:
+          path: ${{ github.workspace }}/theos
+          key: ${{ runner.os }}-theos
+
+      - name: Install Theos
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build (${{ matrix.scheme }})
+        run: make package ${{ matrix.suffix }}
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Upload ${{ matrix.scheme }} DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.scheme }}-deb
+          path: packages/*.deb
